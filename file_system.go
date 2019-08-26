@@ -18,6 +18,11 @@ import (
 // time.Parse format string for parsing file mtimes.
 const timeFormat = "20060102150405"
 
+var dirTimeFormats = []string{
+	"01-02-06  03:04PM",
+	"2006-01-02  15:04",
+}
+
 // Delete deletes the file "path".
 func (c *Client) Delete(path string) error {
 	pconn, err := c.getIdleConn()
@@ -323,9 +328,21 @@ func (f *ftpFile) Sys() interface{} {
 
 var lsRegex = regexp.MustCompile(`^\s*(\S)(\S{3})(\S{3})(\S{3})(?:\s+\S+){3}\s+(\d+)\s+(\w+\s+\d+)\s+([\d:]+)\s+(.+)$`)
 
+func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
+
+	info, err := parseLISTls(entry, loc, skipSelfParent)
+
+	if err != nil {
+
+		info, err = parseLISTdir(entry, loc, skipSelfParent)
+	}
+
+	return info, err
+}
+
 // total 404456
 // drwxr-xr-x   8 goftp    20            272 Jul 28 05:03 git-ignored
-func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
+func parseLISTls(entry string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
 	if strings.HasPrefix(entry, "total ") {
 		return nil, nil
 	}
@@ -388,6 +405,60 @@ func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileIn
 		mode:  mode,
 		mtime: mtime,
 		raw:   entry,
+		size:  int64(size),
+	}
+
+	return info, nil
+}
+
+// parse MSDOS style
+func parseLISTdir(line string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
+
+	var err error
+
+	var mTime time.Time
+	// Try various time formats that DIR might use, and stop when one works.
+	for _, format := range dirTimeFormats {
+		if len(line) > len(format) {
+			mTime, err = time.ParseInLocation(format, line[:len(format)], loc)
+			if err == nil {
+				line = line[len(format):]
+				break
+			}
+		}
+	}
+	if err != nil {
+		// None of the time formats worked.
+		return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry's mtime: %s (%s)`, err, line)}
+	}
+
+	var mode os.FileMode
+	var size uint64
+
+	line = strings.TrimLeft(line, " ")
+	if strings.HasPrefix(line, "<DIR>") {
+		mode |= os.ModeDir
+		line = strings.TrimPrefix(line, "<DIR>")
+	} else {
+		space := strings.Index(line, " ")
+		if space == -1 {
+			return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry's mtime: %s (%s)`, err, line)}
+		}
+		size, err = strconv.ParseUint(line[:space], 10, 64)
+		if err != nil {
+			return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry's mtime: %s (%s)`, err, line)}
+		}
+		mode |= 0
+		line = line[space:]
+	}
+
+	name := strings.TrimLeft(line, " ")
+
+	info := &ftpFile{
+		name:  name,
+		mode:  mode,
+		mtime: mTime,
+		raw:   line,
 		size:  int64(size),
 	}
 
